@@ -1,52 +1,110 @@
-import { ConflictException, Injectable, InternalServerErrorException } from '@nestjs/common';
-import type { RegisterUserDto } from './dto/register-user.dto.js';
-import { PrismaService } from '../prisma/prisma.service.js';
-import bcrypt from 'bcryptjs';
+import {
+  Injectable,
+  UnauthorizedException,
+  ForbiddenException,
+} from '@nestjs/common';
+
+import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import * as bcrypt from 'bcryptjs';
+import { PrismaService } from '../prisma/prisma.service.js';
+import { JwtPayload } from './interface/jwt-payload.interface.js';
+
 @Injectable()
 export class AuthService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly jwtService: JwtService,
+    private readonly configService: ConfigService,
+  ) {}
 
-    constructor(private prisma:PrismaService, private configService:ConfigService){}
+  async validateUser(email: string, password: string) {
+    const normalizedEmail = email.trim().toLowerCase();
 
-    async registerUser(data:RegisterUserDto):Promise<any> {
+    const user = await this.prisma.user.findUnique({
+      where: {
+        email: normalizedEmail,
+      },
+    });
 
-        try{
-        const {email,name, password, role} = data;
-            const saltRounds = this.configService.get<number>('bcrypt_salt_round') ?? 10;
-            const hashedPassword = await bcrypt.hash(password, saltRounds!);
-            const ifExists = await this.findUserByEmail(email);
-            if(ifExists)
-            {
-                throw new ConflictException("User with this email already exists");
-            }
-
-            const user = await this.prisma.user.create({
-                data:{
-                    email,
-                    name,
-                    password:hashedPassword,
-                    role
-                },
-                omit:{
-                    password:true
-                }
-            })
-            return user;
-        }catch(error){
-            console.log(error);
-            throw new InternalServerErrorException("Error while registering user");
-        }
-           
+    if (!user) {
+      throw new UnauthorizedException('Invalid email or password');
     }
 
-    async findUserByEmail(email:string) {
-        return await this.prisma.user.findUnique({
-            where:{
-                email
-            }
-        })
+    const isPasswordMatched = await bcrypt.compare(
+      password,
+      user.password || '',
+    );
+
+    if (!isPasswordMatched) {
+      throw new UnauthorizedException('Invalid email or password');
     }
 
-    
+    const { password: _, ...userWithoutPassword } = user;
 
+    return userWithoutPassword;
+  }
+
+  async generateTokens(user: JwtPayload) {
+    const payload: JwtPayload = {
+      userId: user.userId,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+    };
+
+    const accessToken = await this.jwtService.signAsync(payload, {
+      secret: this.configService.getOrThrow<string>('JWT_ACCESS_SECRET'),
+      expiresIn: '15m',
+    });
+
+    const refreshToken = await this.jwtService.signAsync(payload, {
+      secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
+      expiresIn: '7d',
+    });
+
+    return {
+      accessToken,
+      refreshToken,
+    };
+  }
+
+  // =========================================
+  // 3. Login
+  // =========================================
+
+  async login(user: JwtPayload) {
+    const tokens = await this.generateTokens(user);
+
+    return {
+      user,
+      ...tokens,
+    };
+  }
+
+  // =========================================
+  // 4. Get Current User
+  // =========================================
+
+  async getMe(userId: number) {
+    const user = await this.prisma.user.findUnique({
+      where: {
+        id: userId,
+      },
+      omit: {
+        password: true,
+      },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    return user;
+  }
+
+  async refreshTokens(user: JwtPayload) {
+    // Generate a new access token and refresh token
+    return this.generateTokens(user);
+  }
 }
